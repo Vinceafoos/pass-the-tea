@@ -4,7 +4,7 @@ import { InitialStack } from '@/components/InitialStack';
 import { HomeColors } from '@/constants/homeTheme';
 import type { Profile } from '@/types/database';
 
-export type GroupRowKind = 'claim' | 'waiting' | 'nudge' | 'listen' | 'recap';
+export type GroupRowKind = 'claim' | 'waiting' | 'nudge' | 'listen' | 'record' | 'recap';
 
 type Props = {
   name: string;
@@ -18,13 +18,14 @@ const LABELS: Record<GroupRowKind, string> = {
   waiting: 'Waiting...',
   nudge: 'Nudge',
   listen: 'Listen',
+  record: 'Record',
   recap: 'Recap',
 };
 
 export function GroupsRow({ name, members, kind, onPress }: Props) {
   const dashed = kind === 'waiting' || kind === 'nudge';
   const pillColor =
-    kind === 'claim' || kind === 'listen' || kind === 'recap'
+    kind === 'claim' || kind === 'listen' || kind === 'record' || kind === 'recap'
       ? HomeColors.green
       : kind === 'waiting'
         ? HomeColors.waiting

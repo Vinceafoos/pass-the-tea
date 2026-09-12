@@ -5,6 +5,7 @@ export type HomeGroupSnapshot = {
   members: Profile[];
   thread: Thread | null;
   message: Message | null;
+  previousSenderId: string | null;
   activityAt: string | null;
 };
 

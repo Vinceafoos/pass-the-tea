@@ -46,6 +46,9 @@ export async function getHomeGroups(): Promise<HomeGroupSnapshot[]> {
     groups.map(async (group) => {
       const thread = await getLatestThread(group.id);
       const message = thread?.current_message_id ? await getMessage(thread.current_message_id) : null;
+      const previous = message?.responded_to_message_id
+        ? await getMessage(message.responded_to_message_id)
+        : null;
       const members = (memberships ?? [])
         .filter((row) => row.group_id === group.id)
         .map((row) => profileById.get(row.user_id))
@@ -55,6 +58,7 @@ export async function getHomeGroups(): Promise<HomeGroupSnapshot[]> {
         members,
         thread,
         message,
+        previousSenderId: previous?.sender_id ?? null,
         activityAt: message?.created_at ?? thread?.created_at ?? group.created_at,
       };
     })

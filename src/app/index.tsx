@@ -1,5 +1,5 @@
 import { Redirect, useFocusEffect, useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -11,10 +11,11 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { GroupListCard } from '@/components/GroupListCard';
-import { GroupsRow, type GroupRowKind } from '@/components/GroupsRow';
+import { GroupsRow } from '@/components/GroupsRow';
 import { HomeTabBar, type HomeTab } from '@/components/HomeTabBar';
+import { RelayClaimButton } from '@/components/RelayClaimButton';
 import { WaveformBurst } from '@/components/WaveformBurst';
-import { CLAIM_TTL_MS, isSupabaseConfigured } from '@/constants/config';
+import { isSupabaseConfigured } from '@/constants/config';
 import { HomeColors } from '@/constants/homeTheme';
 import { useActiveMessage } from '@/hooks/useActiveMessage';
 import { useActiveThread } from '@/hooks/useActiveThread';
@@ -29,13 +30,10 @@ import {
   getProfile,
   getSavedPodcasts,
 } from '@/lib/relay';
+import { getRelayAction, isClaimExpired } from '@/lib/relayAction';
+import { supabase } from '@/lib/supabase';
 import type { SavedPodcast } from '@/types/database';
-import type { ClaimUiState, HomeGroupSnapshot } from '@/types/relay';
-
-function isExpired(claimedAt: string | null) {
-  if (!claimedAt) return true;
-  return Date.now() - new Date(claimedAt).getTime() >= CLAIM_TTL_MS;
-}
+import type { HomeGroupSnapshot } from '@/types/relay';
 
 function memberLine(members: HomeGroupSnapshot['members'], currentUserId?: string) {
   const names = members.map((member) =>
@@ -46,21 +44,28 @@ function memberLine(members: HomeGroupSnapshot['members'], currentUserId?: strin
   return [...others, ...you].join(', ');
 }
 
-function rowKind(item: HomeGroupSnapshot, userId: string | undefined): GroupRowKind {
-  const thread = item.thread;
-  const message = item.message;
-  if (!thread) return 'nudge';
-  if (thread.status === 'closed') return 'recap';
-  const openingLive =
-    !message && Boolean(thread.opening_claimed_by) && !isExpired(thread.opening_claimed_at);
-  if (openingLive && thread.opening_claimed_by === userId) return 'listen';
-  if (openingLive) return 'waiting';
-  if (!message) return 'claim';
-  const liveClaim = Boolean(message.claimed_by) && !isExpired(message.claimed_at);
-  if (liveClaim && message.claimed_by === userId) return 'listen';
-  if (liveClaim) return 'waiting';
-  if (userId && message.sender_id === userId) return 'waiting';
-  return 'claim';
+function withLiveRelay(
+  item: HomeGroupSnapshot,
+  live: {
+    groupId: string | undefined;
+    thread: HomeGroupSnapshot['thread'];
+    message: HomeGroupSnapshot['message'];
+    previousSenderId: string | null;
+  },
+): HomeGroupSnapshot {
+  if (item.group.id !== live.groupId || !live.thread) return item;
+  const nextMessage = live.thread.current_message_id
+    ? live.message && live.message.id === live.thread.current_message_id
+      ? live.message
+      : item.message
+    : null;
+  return {
+    ...item,
+    thread: live.thread,
+    message: nextMessage,
+    previousSenderId: nextMessage?.responded_to_message_id ? live.previousSenderId : null,
+    activityAt: nextMessage?.created_at ?? item.activityAt,
+  };
 }
 
 export default function HomeScreen() {
@@ -84,16 +89,18 @@ export default function HomeScreen() {
     refresh: refreshMessage,
   } = useActiveMessage(thread?.current_message_id);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (opts?: { silent?: boolean }) => {
     if (!user) {
       setGroups([]);
       setPodcasts([]);
       setLoading(false);
       return;
     }
-    setLoading(true);
-    setError(null);
-    setArchiveError(null);
+    if (!opts?.silent) {
+      setLoading(true);
+      setError(null);
+      setArchiveError(null);
+    }
     try {
       const nextGroups = await getHomeGroups();
       setGroups(nextGroups);
@@ -104,13 +111,15 @@ export default function HomeScreen() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load groups');
     }
-    try {
-      const nextPodcasts = await getSavedPodcasts();
-      setPodcasts(nextPodcasts);
-    } catch (err) {
-      setArchiveError(err instanceof Error ? err.message : 'Could not load recaps');
-    } finally {
-      setLoading(false);
+    if (!opts?.silent) {
+      try {
+        const nextPodcasts = await getSavedPodcasts();
+        setPodcasts(nextPodcasts);
+      } catch (err) {
+        setArchiveError(err instanceof Error ? err.message : 'Could not load recaps');
+      } finally {
+        setLoading(false);
+      }
     }
   }, [user]);
 
@@ -119,6 +128,33 @@ export default function HomeScreen() {
       void load();
     }, [load])
   );
+
+  const groupIdsKey = groups.map((item) => item.group.id).sort().join(',');
+
+  useEffect(() => {
+    if (!user || !groupIdsKey) return;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const queue = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        void load({ silent: true });
+      }, 250);
+    };
+    const channel = supabase.channel(`home-relay:${user.id}`);
+    for (const groupId of groupIdsKey.split(',')) {
+      channel.on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'threads', filter: `group_id=eq.${groupId}` },
+        queue,
+      );
+    }
+    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, queue);
+    channel.subscribe();
+    return () => {
+      if (timeout) clearTimeout(timeout);
+      void supabase.removeChannel(channel);
+    };
+  }, [user, groupIdsKey, load]);
 
   useEffect(() => {
     if (!message?.responded_to_message_id) {
@@ -130,101 +166,60 @@ export default function HomeScreen() {
     });
   }, [message?.responded_to_message_id]);
 
-  const dayClosed = thread?.status === 'closed';
-  const openingClaimLive =
-    !message &&
-    Boolean(thread?.opening_claimed_by) &&
-    !isExpired(thread?.opening_claimed_at ?? null);
-  const iHoldOpening = openingClaimLive && thread?.opening_claimed_by === user?.id;
-
-  const status: ClaimUiState = useMemo(() => {
-    if (!thread) return { kind: 'empty' };
-    if (dayClosed) return { kind: 'empty' };
-    if (!message) return { kind: 'empty' };
-    const liveClaim = Boolean(message.claimed_by) && !isExpired(message.claimed_at);
-    if (liveClaim && message.claimed_by === user?.id) return { kind: 'claimed_by_me' };
-    if (liveClaim) return { kind: 'claimed_by_other' };
-    if (user?.id && message.sender_id === user.id) return { kind: 'own_message' };
-    if (user?.id && previousSenderId === user.id) return { kind: 'too_soon' };
-    return { kind: 'unclaimed' };
-  }, [thread, dayClosed, message, user?.id, previousSenderId]);
-
-  const claimable = status.kind === 'unclaimed' && Boolean(message);
-  const canClaimOpening = !dayClosed && !message && Boolean(thread) && !openingClaimLive;
-
-  const claimLabel = claiming
-    ? 'Claiming…'
-    : dayClosed
-      ? 'Play recap'
-      : iHoldOpening
-        ? 'Record'
-        : status.kind === 'claimed_by_me'
-          ? 'Listen'
-          : canClaimOpening
-            ? 'Claim'
-            : claimable
-              ? 'Claim'
-              : status.kind === 'claimed_by_other' ||
-                  status.kind === 'own_message' ||
-                  status.kind === 'too_soon' ||
-                  (openingClaimLive && !iHoldOpening)
-                ? 'Waiting...'
-                : 'Claim';
-
-  const claimEnabled =
-    !claiming &&
-    (dayClosed ||
-      iHoldOpening ||
-      status.kind === 'claimed_by_me' ||
-      canClaimOpening ||
-      claimable);
-
-  const claimTone: 'claim' | 'waiting' | 'nudge' =
-    claimLabel === 'Waiting...' || status.kind === 'claimed_by_other'
-      ? 'waiting'
-      : claimEnabled || claiming
-        ? 'claim'
-        : 'nudge';
+  const liveRelay = {
+    groupId: selected?.group.id,
+    thread,
+    message,
+    previousSenderId,
+  };
+  const featured = selected ? withLiveRelay(selected, liveRelay) : null;
+  const featuredAction = getRelayAction({
+    thread: featured?.thread,
+    message: featured?.message,
+    userId: user?.id,
+    previousSenderId: featured?.previousSenderId,
+  });
 
   async function onClaimPress(from?: HomeGroupSnapshot) {
-    const target = from ?? selected;
-    const targetThread = from ? from.thread : thread;
-    const targetMessage = from ? from.message : message;
+    const target = from ?? featured;
+    const targetThread = target?.thread;
+    const targetMessage = target?.message;
     if (!target || !targetThread) return;
     setNotice(null);
-    const targetClosed = targetThread.status === 'closed';
-    const targetOpeningLive =
-      !targetMessage &&
-      Boolean(targetThread.opening_claimed_by) &&
-      !isExpired(targetThread.opening_claimed_at);
-    const targetIHoldOpening = targetOpeningLive && targetThread.opening_claimed_by === user?.id;
-    const targetLiveClaim =
-      Boolean(targetMessage?.claimed_by) && !isExpired(targetMessage?.claimed_at ?? null);
-    const targetClaimedByMe = targetLiveClaim && targetMessage?.claimed_by === user?.id;
-    const targetCanOpening = !targetClosed && !targetMessage && !targetOpeningLive;
+    const action = getRelayAction({
+      thread: targetThread,
+      message: targetMessage,
+      userId: user?.id,
+      previousSenderId: target.previousSenderId,
+    });
 
-    if (targetClosed) {
+    if (action.kind === 'recap') {
       router.push(`/episode/${targetThread.id}`);
       return;
     }
-    if (targetIHoldOpening) {
+    if (action.kind === 'record') {
       router.push({
         pathname: '/record/[threadId]',
         params: { threadId: targetThread.id, groupId: target.group.id, opening: '1' },
       });
       return;
     }
-    if (targetClaimedByMe && targetMessage) {
+    if (action.kind === 'listen' && targetMessage) {
       router.push(`/listen/${targetMessage.id}`);
       return;
     }
+    if (action.kind !== 'claim') return;
 
     setClaiming(true);
     try {
-      if (targetCanOpening) {
+      const openingFree =
+        !targetMessage &&
+        (!targetThread.opening_claimed_by || isClaimExpired(targetThread.opening_claimed_at));
+
+      if (openingFree) {
         const result = await claimOpening(targetThread.id);
         if (result.success) {
-          await refreshThread();
+          await Promise.all([refreshThread(), load({ silent: true })]);
           router.push({
             pathname: '/record/[threadId]',
             params: { threadId: targetThread.id, groupId: target.group.id, opening: '1' },
@@ -234,7 +229,7 @@ export default function HomeScreen() {
         if (result.reason === 'already_claimed') {
           const profile = result.claimed_by ? await getProfile(result.claimed_by) : null;
           setNotice(`Too slow — ${profile?.display_name ?? 'someone else'} is recording`);
-          await refreshThread();
+          await Promise.all([refreshThread(), load({ silent: true })]);
           return;
         }
         setNotice(result.reason);
@@ -244,14 +239,14 @@ export default function HomeScreen() {
       if (!targetMessage) return;
       const result = await claimMessage(targetMessage.id);
       if (result.success) {
-        await Promise.all([refreshThread(), refreshMessage(), load()]);
+        await Promise.all([refreshThread(), refreshMessage(), load({ silent: true })]);
         router.push(`/listen/${targetMessage.id}`);
         return;
       }
       if (result.reason === 'already_claimed') {
         const profile = result.claimed_by ? await getProfile(result.claimed_by) : null;
         setNotice(`Too slow — claimed by ${profile?.display_name ?? 'someone else'}`);
-        await Promise.all([refreshThread(), refreshMessage()]);
+        await Promise.all([refreshThread(), refreshMessage(), load({ silent: true })]);
         return;
       }
       if (result.reason === 'own_message') {
@@ -294,8 +289,6 @@ export default function HomeScreen() {
     return <Redirect href="/login" />;
   }
 
-  const live = claimable || canClaimOpening;
-
   return (
     <SafeAreaView style={styles.screen} edges={['top']}>
       <View style={styles.bodyWrap}>
@@ -306,11 +299,11 @@ export default function HomeScreen() {
               <Text style={styles.body}>
                 Signed in as {user.email ?? 'unknown'}, but this account is not in a group yet.
               </Text>
-            ) : selected ? (
+            ) : featured ? (
               <>
                 <Pressable
                   style={styles.featuredHeader}
-                  onPress={() => router.push(`/group/${selected.group.id}`)}>
+                  onPress={() => router.push(`/group/${featured.group.id}`)}>
                   <View style={styles.icon}>
                     <Text style={styles.glyph}>🎸</Text>
                   </View>
@@ -319,58 +312,57 @@ export default function HomeScreen() {
                       <View
                         style={[
                           styles.dot,
-                          { backgroundColor: live ? HomeColors.orange : HomeColors.green },
+                          {
+                            backgroundColor:
+                              featuredAction.kind === 'claim' || featuredAction.kind === 'listen'
+                                ? HomeColors.orange
+                                : HomeColors.green,
+                          },
                         ]}
                       />
-                      <Text style={styles.groupName}>{selected.group.name}</Text>
+                      <Text style={styles.groupName}>{featured.group.name}</Text>
                     </View>
                     <Text style={styles.names} numberOfLines={1}>
-                      {memberLine(selected.members, user.id)}
+                      {memberLine(featured.members, user.id)}
                     </Text>
                   </View>
                   <Text style={styles.time}>
-                    {formatRelativeTime(message?.created_at ?? selected.activityAt)}
+                    {formatRelativeTime(featured.message?.created_at ?? featured.activityAt)}
                   </Text>
                 </Pressable>
 
-                <WaveformBurst members={selected.members} />
+                <WaveformBurst members={featured.members} />
 
-                <Pressable
-                  accessibilityRole="button"
-                  disabled={!claimEnabled}
+                <RelayClaimButton
+                  action={featuredAction}
+                  claiming={claiming}
                   onPress={() => void onClaimPress()}
-                  style={({ pressed }) => [
-                    styles.claim,
-                    {
-                      backgroundColor:
-                        claimTone === 'waiting'
-                          ? HomeColors.waiting
-                          : claimTone === 'nudge'
-                            ? HomeColors.nudge
-                            : HomeColors.green,
-                    },
-                    pressed && claimEnabled && styles.claimPressed,
-                  ]}>
-                  <Text style={styles.claimLabel}>{claimLabel}</Text>
-                </Pressable>
+                />
                 {notice ? <Text style={styles.notice}>{notice}</Text> : null}
 
                 <View style={styles.sheet}>
-                  {groups.map((item) => (
-                    <GroupListCard
-                      key={item.group.id}
-                      name={item.group.name}
-                      members={item.members}
-                      currentUserId={user.id}
-                      activityAt={item.activityAt}
-                      live={item.group.id === selected.group.id ? live : item.thread?.status === 'active'}
-                      selected={item.group.id === selected.group.id}
-                      onPress={() => {
-                        setNotice(null);
-                        setSelectedGroupId(item.group.id);
-                      }}
-                    />
-                  ))}
+                  {groups.map((item) => {
+                    const card = withLiveRelay(item, liveRelay);
+                    return (
+                      <GroupListCard
+                        key={item.group.id}
+                        name={card.group.name}
+                        members={card.members}
+                        currentUserId={user.id}
+                        activityAt={card.activityAt}
+                        live={
+                          card.group.id === featured.group.id
+                            ? featuredAction.kind === 'claim' || featuredAction.kind === 'listen'
+                            : card.thread?.status === 'active'
+                        }
+                        selected={card.group.id === featured.group.id}
+                        onPress={() => {
+                          setNotice(null);
+                          setSelectedGroupId(item.group.id);
+                        }}
+                      />
+                    );
+                  })}
                 </View>
               </>
             ) : null}
@@ -407,22 +399,30 @@ export default function HomeScreen() {
         {tab === 'groups' ? (
           <ScrollView contentContainerStyle={styles.pane}>
             <Text style={styles.paneKicker}>GROUPS</Text>
-            {groups.map((item) => (
-              <GroupsRow
-                key={item.group.id}
-                name={item.group.name}
-                members={item.members}
-                kind={rowKind(item, user.id)}
-                onPress={() => {
-                  const kind = rowKind(item, user.id);
-                  if (kind === 'waiting' || kind === 'nudge') {
-                    router.push(`/group/${item.group.id}`);
-                    return;
-                  }
-                  void onClaimPress(item);
-                }}
-              />
-            ))}
+            {groups.map((item) => {
+              const row = withLiveRelay(item, liveRelay);
+              const action = getRelayAction({
+                thread: row.thread,
+                message: row.message,
+                userId: user.id,
+                previousSenderId: row.previousSenderId,
+              });
+              return (
+                <GroupsRow
+                  key={item.group.id}
+                  name={row.group.name}
+                  members={row.members}
+                  kind={action.kind}
+                  onPress={() => {
+                    if (action.kind === 'waiting' || action.kind === 'nudge') {
+                      router.push(`/group/${item.group.id}`);
+                      return;
+                    }
+                    void onClaimPress(row);
+                  }}
+                />
+              );
+            })}
             <Pressable style={styles.signOut} onPress={() => void signOut()}>
               <Text style={styles.signOutLabel}>Sign out</Text>
             </Pressable>
